@@ -1,6 +1,6 @@
 # Car Insurance Pricing
 
-Academic project in non-life actuarial science (Master Actuariat & Finance, University of Rouen Normandie). Originally a group project of three students; this version is a full rework of the code. The code and its comments are in French.
+Academic project in non-life actuarial science (Master Actuariat & Finance, University of Rouen Normandie). The code and its comments are in French.
 
 ## Goal
 Build a car insurance tariff from a policy portfolio, a claims database and telematics data: pure premium with a frequency × severity model, then technical and commercial premium.
