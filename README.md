@@ -10,7 +10,7 @@ Build a car insurance tariff from a policy portfolio, a claims database and tele
 - Claims: 4,044 claims with a positive cost, total 13.56 MEUR
 - Telematics: 100,332 rows (distance, driving times, harsh braking and acceleration, turns)
 
-The course files are not published (see `data/README.md`). They are based on the public synthetic telematics dataset of So, Boucher and Valdez (2021), *Synthetic Dataset Generation of Driver Telematics*, Risks 9(4), 58, available at http://www2.math.uconn.edu/~valdez/data.html. For the course, the data was split into three files and data-quality issues were added (inconsistent categories, duplicates, missing values), which the cleaning step handles.
+The course files are not published (see `data/README.md`). They are based on the public synthetic telematics dataset of So, Boucher and Valdez (2021), *Synthetic Dataset Generation of Driver Telematics*, Risks 9(4), 58, available at http://www2.math.uconn.edu/~valdez/data.html. The data was split into three files and data-quality issues were added (inconsistent categories, duplicates, missing values), which the cleaning step handles.
 
 ## Method
 1. **Data cleaning and descriptive analysis.**
