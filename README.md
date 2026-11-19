@@ -1,9 +1,9 @@
 # Car Insurance Pricing
 
-Academic project in non-life actuarial science (Master Actuariat & Finance, University of Rouen Normandie). The code and its comments are in French.
+Academic project in non-life actuarial science (Master Actuariat & Finance, University of Rouen Normandie). Originally a group project of three students; this version is a full rework of the code. The code and its comments are in French.
 
 ## Goal
-Build a car insurance tariff from a policy portfolio, a claims database and telematics data: pure premium with a frequency × severity model, then technical and commercial premium.
+Build a car insurance tariff from a policy portfolio, a claims database and telematics data: pure premium with a frequency × severity model, then commercial premium.
 
 ## Data
 - Portfolio: 100,399 rows, 99,837 contracts after cleaning
@@ -13,42 +13,61 @@ Build a car insurance tariff from a policy portfolio, a claims database and tele
 The data comes from the course and is not published (see `data/README.md`).
 
 ## Method
-1. **Data cleaning**: harmonised categories (unknown values kept as `Unknown`), pure and impure duplicates, missing values, consistency between age and years without claims, telematics duplicates (one real row and one empty row per contract).
-2. **Train / test split**: 80 / 20 by contract, done once at the start. Variable selection, the capping threshold and every calibration use the training set only. The test set is used only for validation.
-3. **Frequency**: Poisson GLM with an exposure offset. Variables selected with a lasso (`glmnet`, 5-fold cross-validation, `lambda.1se`), then the GLM is refitted on the selected variables. Over-dispersion checked against a negative binomial model.
-4. **Severity**: cost per claim (amount / number of claims), Gamma GLM with log link, weighted by the number of claims, on costs capped at a threshold chosen with the elbow method. The cost above the threshold is spread over all claims with a loading coefficient.
-5. **Pure premium** = annual frequency × capped average cost × loading coefficient.
-6. **Commercial premium**: floor 40 EUR, cap 800 EUR, rebalancing so that the total is unchanged, 5% safety loading, 3% acquisition costs.
+1. **Data cleaning and descriptive analysis.**
+2. **Train / test split** (80 / 20 by contract).
+3. **Frequency**: Poisson GLM. Variables selected with a lasso, non-significant variables removed. The exposure coefficient is estimated, because claims are not proportional to the contract duration. Natural splines are used where an effect is not linear.
+4. **Severity**, cost per claim split at the 97.5th percentile:
+   - attritional claims (below the threshold): Gamma GLM. A log-normal model was tested and rejected, because its residuals are not normal;
+   - large claims (above the threshold): share and average cost estimated on the whole portfolio.
+5. **Pure premium** = annual frequency × [(1 − p) × predicted attritional cost + p × average large-claim cost].
+6. **Commercial premium**: floor 40 EUR, cap 800 EUR, rebalancing, 5% safety loading, 3% acquisition costs.
 
-## Results (test set unless stated otherwise)
+## Assumptions checked
+| Assumption | Check | Result |
+|---|---|---|
+| Frequency: variance = mean | Pearson dispersion, negative binomial | verified (1.09) |
+| Frequency: no excess zeros | observed vs predicted P(N = k) | verified |
+| Frequency: claims proportional to duration | test of the exposure coefficient | rejected, coefficient estimated (0.68) |
+| Linear effects of continuous variables | spline tests | splines where needed |
+| Attritional cost: log-normal | residual Q-Q plot | rejected |
+| Attritional cost: Gamma | quantile residual Q-Q plot | verified |
+| Log link | test of the squared linear predictor | verified for severity; small departure for frequency, no effect on the test set |
+| No influential observation | Cook's distance | verified |
+| No omitted interaction or variable | usage × area, territory | none for frequency; territory effect on severity not included |
+| Frequency and severity independent | Wilcoxon test | verified |
+| Independent policyholders | one row per contract | assumed |
+
+## Results
 | Item | Value |
 |---|---|
-| Observed annual frequency (whole portfolio) | 4.72% |
-| Claims observed / predicted on the test set | 837 / 809 |
-| Pearson dispersion (Poisson) | 1.09 |
-| Poisson deviance explained vs a model without variables | 17.7% |
-| Capping threshold (elbow, training set) | 7,413 EUR (90th percentile) |
-| Loading coefficient for the cost above the threshold | 1.27 |
-| Mean pure premium | 145 EUR |
-| Mean commercial premium | 159 EUR |
-| Closing ratio, pure premium / observed claims | 1.006 training, 0.971 test |
-
-Most predictive variables for frequency: distance driven, share of the year driven, weekday driving, car age, credit score, harsh braking and turn intensity.
+| Claims observed / predicted on the test set | 837 / 808 |
+| Large-claim threshold | 16,584 EUR (2.5% of claims, average cost 26,814 EUR) |
+| Claims cost predicted / observed on the test set | 1.007 |
+| Closing ratio, predicted / observed claims cost | 1.008 training, 0.968 test |
+| Mean annual pure premium | 143 EUR |
+| Mean commercial premium | 155 EUR |
 
 ![Frequency lift](figures/lift_frequence.png)
 
 ![Pure premium lift](figures/lift_prime_pure.png)
 
+![Gamma quantile residuals](figures/residus_gamma.png)
+
+![Log-normal residuals](figures/residus_lognormal.png)
+
 ## Limits
-- The cost model is weak (test MAE 2,676 EUR against 2,828 EUR for the plain average): most of the segmentation comes from the frequency model.
-- With a 40 EUR floor, 31% of contracts pay the minimum premium. The floor and the cap are commercial choices to be discussed.
+- p-values after lasso selection are optimistic.
+- The large-claim cost is the same for every policyholder, as there are too few large claims to model it.
+- Territory has an effect on claim cost that is not included.
+- With a 40 EUR floor, about a third of contracts pay the minimum premium.
+- The annual premium uses telematics measured over the contract duration, without annualising it.
 
 ## Repository content
-- `R/tarification_auto.Rmd`: the full analysis (cleaning, models, premiums), as an R Markdown notebook
-- `figures/`: lift charts on the test set
+- `R/tarification_auto.Rmd`: the full analysis, as an R Markdown notebook
+- `figures/`: lift charts and residual plots
 - `data/`: expected data files (not published)
 
 ## How to reproduce
 1. Install R (4.3 or later) and the packages `readxl`, `glmnet`, `MASS`, `rmarkdown`.
 2. Put the three data files in `data/`.
-3. Open `R/tarification_auto.Rmd` in RStudio and click Knit (or run `rmarkdown::render("R/tarification_auto.Rmd")`). The report is rendered as HTML and the tariff is written to `out/tarif.csv`. Run time is about one minute.
+3. Open `R/tarification_auto.Rmd` in RStudio and click Knit. The report is rendered as HTML and the tariff is written to `out/tarif.csv`.
