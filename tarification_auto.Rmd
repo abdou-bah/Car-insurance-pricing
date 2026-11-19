@@ -1,0 +1,537 @@
+---
+title: "Tarification d'une assurance automobile"
+subtitle: "Modèle fréquence × coût"
+author: "Abdou Bah"
+date: "Novembre 2026"
+output:
+  html_document:
+    toc: true
+    toc_depth: 2
+    toc_float: true
+    number_sections: true
+    theme: flatly
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
+                      fig.align = "center", fig.width = 7, fig.height = 4)
+knitr::opts_knit$set(root.dir = "..")
+
+library(readxl)
+library(glmnet)
+library(MASS)
+
+set.seed(2026)
+```
+
+# Introduction
+
+L'objectif est de construire un tarif automobile à partir de trois bases : le portefeuille de contrats, les sinistres et des données télématiques. La prime pure est obtenue par un modèle fréquence × coût, puis transformée en prime commerciale.
+
+Démarche :
+
+- un seul découpage apprentissage / test (80 / 20) par contrat, fait avant toute modélisation ;
+- sélection des variables par lasso sur l'apprentissage ;
+- fréquence : GLM de Poisson avec exposition ;
+- coût : GLM Gamma sur le coût par sinistre écrêté, la part au-delà du seuil étant mutualisée ;
+- validation sur le test : nombre de sinistres, courbes de lift, ratio de bouclage.
+
+# Préparation des données
+
+## Chargement
+
+```{r chargement}
+base_ptf <- as.data.frame(read_excel("data/DB_CNT.xlsx", sheet = "DB_CNT"))
+base_sin <- read.delim("data/DB_SIN.txt", stringsAsFactors = FALSE)
+telematic <- read.csv("data/DB_TELEMATICS.csv", sep = ";", stringsAsFactors = FALSE,
+                      fileEncoding = "UTF-8-BOM")
+
+c(portefeuille = nrow(base_ptf), sinistres = nrow(base_sin), telematique = nrow(telematic))
+```
+
+## Portefeuille : formats et modalités
+
+`Credit.score`, `Annual.miles.drive` et `Years.noclaims` sont lues comme du texte. `Years.noclaims` contient la valeur non numérique « EAJ », remplacée par une valeur manquante.
+
+```{r ptf-formats}
+base_ptf$Credit.score <- as.numeric(base_ptf$Credit.score)
+base_ptf$Annual.miles.drive <- as.numeric(base_ptf$Annual.miles.drive)
+
+yn <- base_ptf$Years.noclaims
+yn[!grepl("^[0-9]+$", yn)] <- NA
+base_ptf$Years.noclaims <- as.numeric(yn)
+```
+
+Les modalités sont harmonisées. Les valeurs inconnues du sexe et de l'usage (codes numériques, « ? », « Inc ») sont gardées comme modalité `Unknown` plutôt qu'affectées arbitrairement à une autre modalité.
+
+```{r ptf-modalites}
+base_ptf$Insured.sex[base_ptf$Insured.sex == "F"] <- "Female"
+base_ptf$Insured.sex[base_ptf$Insured.sex == "H"] <- "Male"
+
+base_ptf$Marital[grepl("^Mari", base_ptf$Marital)] <- "Married"
+base_ptf$Marital[base_ptf$Marital == "Celib"] <- "Single"
+
+usages_valides <- c("Commute", "Private", "Commercial", "Farmer")
+inconnu <- !is.na(base_ptf$Car.use) & !(base_ptf$Car.use %in% usages_valides)
+base_ptf$Car.use[inconnu] <- "Unknown"
+
+for (v in c("Insured.sex", "Marital", "Car.use", "Region")) {
+  cat("\n", v, "\n")
+  print(table(base_ptf[[v]], useNA = "ifany"))
+}
+```
+
+## Portefeuille : doublons
+
+Les doublons purs sont supprimés. Pour les doublons impurs (même `Id_pol`, valeurs différentes), on garde la ligne de `Duration` maximale et on complète ses valeurs manquantes avec les autres lignes du contrat.
+
+```{r ptf-doublons}
+cat("Doublons purs :", sum(duplicated(base_ptf)), "\n")
+base_ptf <- base_ptf[!duplicated(base_ptf), ]
+
+est_manquant <- function(x) {
+  is.na(x) | x == "" | x == "Unknown"
+}
+
+ids_doublons <- unique(base_ptf$Id_pol[duplicated(base_ptf$Id_pol)])
+cat("Contrats en doublon impur :", length(ids_doublons), "\n")
+
+base_unique <- base_ptf[!(base_ptf$Id_pol %in% ids_doublons), ]
+base_dup <- base_ptf[base_ptf$Id_pol %in% ids_doublons, ]
+base_dup <- base_dup[order(base_dup$Id_pol, -base_dup$Duration), ]
+
+lignes <- list()
+for (id in ids_doublons) {
+  g <- base_dup[base_dup$Id_pol == id, ]
+  ligne <- g[1, ]
+  for (col in names(g)) {
+    if (est_manquant(ligne[[col]])) {
+      valeurs <- g[[col]][!est_manquant(g[[col]])]
+      if (length(valeurs) > 0) ligne[[col]] <- valeurs[1]
+    }
+  }
+  lignes[[length(lignes) + 1]] <- ligne
+}
+base_ptf <- rbind(base_unique, do.call(rbind, lignes))
+
+cat("Doublons restants :", sum(duplicated(base_ptf$Id_pol)), "\n")
+```
+
+## Portefeuille : valeurs manquantes et incohérentes
+
+Les valeurs manquantes concernent moins de 0,2 % des contrats : les lignes sont supprimées.
+
+```{r ptf-na}
+colSums(is.na(base_ptf))
+base_ptf <- na.omit(base_ptf)
+```
+
+On suppose une carence de 21 jours : les contrats de moins de 22 jours sont retirés. Les autres contrôles (âges, ancienneté du véhicule) ne détectent aucune valeur aberrante.
+
+```{r ptf-controles}
+cat("Duration < 22 jours :", sum(base_ptf$Duration < 22), "\n")
+base_ptf <- base_ptf[base_ptf$Duration >= 22, ]
+
+cat("Insured.age < 16 :", sum(base_ptf$Insured.age < 16),
+    "| Insured.age > 103 :", sum(base_ptf$Insured.age > 103),
+    "| Car.age < -2 :", sum(base_ptf$Car.age < -2), "\n")
+```
+
+`age-YNC` vaut `Insured.age - Years.noclaims`. Une valeur inférieure à 16 ans est impossible : on la ramène à 16 et on recalcule `Years.noclaims`.
+
+```{r ptf-agync}
+trop_jeune <- which(base_ptf[["age-YNC"]] < 16)
+cat("Contrats corrigés :", length(trop_jeune), "\n")
+
+base_ptf[["age-YNC"]][trop_jeune] <- 16
+base_ptf$Years.noclaims[trop_jeune] <- base_ptf$Insured.age[trop_jeune] - 16
+
+base_ptf$expo <- base_ptf$Duration / 366
+cat("Contrats après nettoyage :", nrow(base_ptf), "\n")
+```
+
+## Sinistres
+
+`NB_Claim` contient des valeurs du type « NB_CLAIM:1 » et `AMT_Claim` des montants « ANN », qui correspondent tous à des contrats absents du portefeuille.
+
+```{r sin-formats}
+base_sin$NB_Claim <- as.numeric(gsub("NB_CLAIM:", "", base_sin$NB_Claim, ignore.case = TRUE))
+base_sin$AMT_Claim <- suppressWarnings(as.numeric(gsub(",", ".", base_sin$AMT_Claim)))
+
+table(base_sin$NB_Claim, useNA = "ifany")
+cat("Montants « ANN » :", sum(is.na(base_sin$AMT_Claim)), "\n")
+cat("Lignes sans contrat dans le portefeuille :", sum(!(base_sin$Id_pol %in% base_ptf$Id_pol)), "\n")
+
+base_sin <- base_sin[!is.na(base_sin$AMT_Claim) & !is.na(base_sin$NB_Claim), ]
+```
+
+Les doublons impurs associent une ligne avec montant et une ligne à zéro : on cumule les montants par contrat.
+
+```{r sin-doublons}
+cat("Doublons purs :", sum(duplicated(base_sin)), "\n")
+base_sin <- base_sin[!duplicated(base_sin), ]
+
+montant <- aggregate(AMT_Claim ~ Id_pol, data = base_sin, FUN = sum)
+nombre <- aggregate(NB_Claim ~ Id_pol, data = base_sin, FUN = max)
+base_sin <- merge(nombre, montant, by = "Id_pol")
+```
+
+Les sinistres de coût nul sont des sinistres sans suite. Les garder dans la fréquence alors qu'ils sont exclus du coût moyen surestimerait la prime pure : ils sont retirés.
+
+```{r sin-cout-nul}
+cat("Contrats sinistrés :", nrow(base_sin), "| dont coût nul :", sum(base_sin$AMT_Claim == 0),
+    "| coût négatif :", sum(base_sin$AMT_Claim < 0), "\n")
+base_sin <- base_sin[base_sin$AMT_Claim > 0, ]
+```
+
+## Télématique
+
+```{r tele-formats}
+for (col in names(telematic)[-1]) {
+  telematic[[col]] <- as.numeric(gsub(",", ".", telematic[[col]]))
+}
+telematic$Id_pol <- gsub("^cnt_", "", telematic$Id_pol)
+```
+
+Chaque doublon est formé d'une ligne réelle et d'une ligne entièrement à zéro : on garde la ligne avec la plus grande distance parcourue.
+
+```{r tele-doublons}
+cat("Doublons :", sum(duplicated(telematic$Id_pol)), "\n")
+telematic <- telematic[order(telematic$Id_pol, -telematic$Total.miles.driven), ]
+telematic <- telematic[!duplicated(telematic$Id_pol), ]
+```
+
+Les parts de conduite des sept jours somment à 1, de même que semaine et week-end. Ces variables sont parfaitement colinéaires : on retire `Pct.drive.sun` et `Pct.drive.wkend`.
+
+```{r tele-colinearite}
+jours <- telematic$Pct.drive.mon + telematic$Pct.drive.tue + telematic$Pct.drive.wed +
+  telematic$Pct.drive.thr + telematic$Pct.drive.fri + telematic$Pct.drive.sat + telematic$Pct.drive.sun
+summary(jours)
+
+telematic$Pct.drive.sun <- NULL
+telematic$Pct.drive.wkend <- NULL
+```
+
+Les variables de comptage (distance, accélérations, freinages, virages) sont très asymétriques : elles sont transformées par log(1 + x).
+
+```{r tele-log}
+var_comptage <- c("Total.miles.driven",
+                  grep("^(Accel|Brake|Left|Right)", names(telematic), value = TRUE))
+for (col in var_comptage) {
+  telematic[[col]] <- log1p(telematic[[col]])
+}
+```
+
+## Base de modélisation
+
+Un contrat par ligne. Les contrats sans données télématiques sont exclus plutôt que complétés par des zéros, qui signifieraient « aucun kilomètre parcouru ».
+
+```{r base}
+cat("Contrats sans télématique :", sum(!(base_ptf$Id_pol %in% telematic$Id_pol)), "\n")
+
+base <- merge(base_ptf, telematic, by = "Id_pol")
+base <- merge(base, base_sin, by = "Id_pol", all.x = TRUE)
+base$NB_Claim[is.na(base$NB_Claim)] <- 0
+base$AMT_Claim[is.na(base$AMT_Claim)] <- 0
+
+for (v in c("Insured.sex", "Marital", "Car.use", "Region")) {
+  base[[v]] <- factor(base[[v]])
+}
+base$Car.use <- relevel(base$Car.use, ref = "Private")
+
+cat("Contrats :", nrow(base), "| sinistres :", sum(base$NB_Claim),
+    "| charge :", round(sum(base$AMT_Claim)), "EUR\n")
+cat("Fréquence annuelle observée :", round(sum(base$NB_Claim) / sum(base$expo) * 100, 2), "%\n")
+```
+
+# Découpage apprentissage / test
+
+Le découpage est fait une seule fois, par contrat. La sélection des variables, le seuil d'écrêtement et le calibrage utilisent uniquement l'apprentissage. Le test ne sert qu'à la validation.
+
+```{r split}
+idx <- sample(nrow(base), round(0.8 * nrow(base)))
+train <- base[idx, ]
+test <- base[-idx, ]
+c(apprentissage = nrow(train), test = nrow(test))
+```
+
+Variables candidates et fonction qui récupère les variables gardées par le lasso :
+
+```{r candidates}
+var_quali <- c("Insured.sex", "Marital", "Car.use", "Region")
+var_quanti <- c("Insured.age", "Car.age", "Credit.score", "Annual.miles.drive",
+                "Years.noclaims", setdiff(names(telematic), "Id_pol"))
+candidates <- c(var_quali, var_quanti)
+formule_complete <- as.formula(paste("~", paste(candidates, collapse = " + ")))
+
+variables_lasso <- function(cv_model) {
+  b <- coef(cv_model, s = "lambda.1se")
+  noms <- rownames(b)[as.vector(b != 0)]
+  gardees <- c()
+  for (v in candidates) {
+    if (v %in% var_quali) {
+      if (any(startsWith(noms, v))) gardees <- c(gardees, v)
+    } else {
+      if (v %in% noms) gardees <- c(gardees, v)
+    }
+  }
+  gardees
+}
+```
+
+# Modèle de fréquence
+
+## Sélection et ajustement
+
+Le lasso (validation croisée à 5 blocs, `lambda.1se`) remplace le stepAIC : il gère mieux les variables télématiques corrélées. Le GLM de Poisson est ensuite réajusté sur les variables retenues.
+
+```{r freq-lasso}
+X_train <- model.matrix(formule_complete, data = train)[, -1]
+cv_freq <- cv.glmnet(X_train, train$NB_Claim, family = "poisson", alpha = 1,
+                     offset = log(train$expo), nfolds = 5)
+var_freq <- variables_lasso(cv_freq)
+var_freq
+```
+
+```{r freq-glm}
+formule_freq <- as.formula(paste("NB_Claim ~", paste(var_freq, collapse = " + "),
+                                 "+ offset(log(expo))"))
+mod_freq <- glm(formule_freq, family = poisson(link = "log"), data = train)
+summary(mod_freq)
+```
+
+## Surdispersion
+
+```{r freq-dispersion}
+dispersion <- sum(residuals(mod_freq, type = "pearson")^2) / mod_freq$df.residual
+mod_nb <- suppressWarnings(glm.nb(formule_freq, data = train))
+
+c(dispersion = round(dispersion, 3), AIC_poisson = round(AIC(mod_freq)),
+  AIC_binomiale_negative = round(AIC(mod_nb)))
+```
+
+La dispersion est proche de 1 et la binomiale négative n'améliore pas l'AIC : le modèle de Poisson est conservé.
+
+## Validation sur le test
+
+```{r freq-test}
+test$nb_pred <- predict(mod_freq, newdata = test, type = "response")
+
+deviance_poisson <- function(y, mu) {
+  2 * sum(ifelse(y > 0, y * log(y / mu), 0) - (y - mu))
+}
+freq_moy_train <- sum(train$NB_Claim) / sum(train$expo)
+dev_modele <- deviance_poisson(test$NB_Claim, test$nb_pred)
+dev_nul <- deviance_poisson(test$NB_Claim, freq_moy_train * test$expo)
+
+data.frame(indicateur = c("Sinistres observés", "Sinistres prédits",
+                          "Fréquence observée (%)", "Fréquence prédite (%)",
+                          "Déviance expliquée (%)"),
+           valeur = round(c(sum(test$NB_Claim), sum(test$nb_pred),
+                            sum(test$NB_Claim) / sum(test$expo) * 100,
+                            sum(test$nb_pred) / sum(test$expo) * 100,
+                            (1 - dev_modele / dev_nul) * 100), 2))
+```
+
+La déviance expliquée compare le modèle à une fréquence constante estimée sur l'apprentissage.
+
+```{r freq-lift}
+test$decile_freq <- cut(rank(test$nb_pred / test$expo, ties.method = "first"),
+                        breaks = 10, labels = FALSE)
+lift_freq <- data.frame(decile = 1:10,
+                        observee = tapply(test$NB_Claim, test$decile_freq, sum) /
+                          tapply(test$expo, test$decile_freq, sum),
+                        predite = tapply(test$nb_pred, test$decile_freq, sum) /
+                          tapply(test$expo, test$decile_freq, sum))
+
+plot(lift_freq$decile, lift_freq$observee * 100, type = "b", pch = 19, col = "firebrick",
+     ylim = range(c(lift_freq$observee, lift_freq$predite)) * 100,
+     xlab = "Décile de risque prédit", ylab = "Fréquence annuelle (%)",
+     main = "Fréquence observée et prédite par décile (test)")
+lines(lift_freq$decile, lift_freq$predite * 100, type = "b", pch = 17, col = "steelblue", lty = 2)
+legend("topleft", legend = c("Observée", "Prédite"), col = c("firebrick", "steelblue"),
+       pch = c(19, 17), lty = c(1, 2), bty = "n")
+```
+
+# Modèle de coût
+
+## Coût par sinistre
+
+Le montant d'un contrat couvre tous ses sinistres. Le coût modélisé est donc le coût moyen par sinistre, et chaque contrat est pondéré par son nombre de sinistres.
+
+```{r cout-base}
+sin_train <- train[train$NB_Claim > 0, ]
+sin_test <- test[test$NB_Claim > 0, ]
+sin_train$cout <- sin_train$AMT_Claim / sin_train$NB_Claim
+sin_test$cout <- sin_test$AMT_Claim / sin_test$NB_Claim
+
+c(apprentissage = nrow(sin_train), test = nrow(sin_test))
+summary(sin_train$cout)
+```
+
+## Seuil d'écrêtement
+
+Le seuil est choisi par la méthode du coude, sur l'apprentissage : c'est le point de la courbe des coûts triés le plus éloigné de la droite qui joint ses extrémités.
+
+```{r cout-seuil}
+y_tri <- sort(sin_train$cout)
+n <- length(y_tri)
+distance <- abs((y_tri[n] - y_tri[1]) * (1:n) - (n - 1) * y_tri + n * y_tri[1] - y_tri[n])
+seuil <- y_tri[which.max(distance)]
+
+cat("Seuil :", round(seuil), "EUR | percentile :", round(which.max(distance) / n * 100, 1), "%\n")
+```
+
+Sensibilité : part de la charge située au-delà de différents seuils.
+
+```{r cout-sensibilite}
+quantiles <- c(0.90, 0.95, 0.975, 0.99)
+sensibilite <- data.frame(percentile = quantiles * 100, seuil = NA, part_charge = NA)
+for (i in 1:length(quantiles)) {
+  u <- quantile(sin_train$cout, quantiles[i])
+  sensibilite$seuil[i] <- round(u)
+  sensibilite$part_charge[i] <- round(sum(sin_train$NB_Claim * pmax(sin_train$cout - u, 0)) /
+                                        sum(sin_train$AMT_Claim) * 100, 1)
+}
+sensibilite
+```
+
+La part au-delà du seuil (surcrête) est répartie sur tous les sinistres par un coefficient multiplicatif.
+
+```{r cout-surcrete}
+sin_train$cout_ecrete <- pmin(sin_train$cout, seuil)
+
+surcrete <- sum(sin_train$NB_Claim * pmax(sin_train$cout - seuil, 0))
+charge_ecretee <- sum(sin_train$NB_Claim * sin_train$cout_ecrete)
+coef_surcrete <- 1 + surcrete / charge_ecretee
+coef_surcrete
+```
+
+## GLM Gamma
+
+```{r cout-lasso}
+X_sin <- model.matrix(formule_complete, data = sin_train)[, -1]
+cv_cout <- cv.glmnet(X_sin, sin_train$cout_ecrete, family = Gamma(link = "log"), alpha = 1,
+                     weights = sin_train$NB_Claim, nfolds = 5)
+var_cout <- variables_lasso(cv_cout)
+var_cout
+```
+
+```{r cout-glm}
+if (length(var_cout) == 0) {
+  formule_cout <- cout_ecrete ~ 1
+} else {
+  formule_cout <- as.formula(paste("cout_ecrete ~", paste(var_cout, collapse = " + ")))
+}
+mod_cout <- glm(formule_cout, family = Gamma(link = "log"), weights = NB_Claim, data = sin_train)
+summary(mod_cout)
+```
+
+## Validation sur le test
+
+```{r cout-test}
+sin_test$cout_pred <- predict(mod_cout, newdata = sin_test, type = "response") * coef_surcrete
+
+data.frame(indicateur = c("Charge observée", "Charge prédite",
+                          "MAE du modèle", "MAE du coût moyen seul"),
+           valeur = round(c(sum(sin_test$AMT_Claim),
+                            sum(sin_test$NB_Claim * sin_test$cout_pred),
+                            mean(abs(sin_test$cout - sin_test$cout_pred)),
+                            mean(abs(sin_test$cout - mean(sin_train$cout))))))
+```
+
+Le modèle de coût reproduit bien la charge totale, mais il améliore peu l'erreur individuelle par rapport au coût moyen : l'essentiel de la segmentation vient de la fréquence.
+
+# Prime pure
+
+## Calcul
+
+Prime pure annuelle = fréquence annuelle × coût moyen écrêté × coefficient de surcrête.
+
+```{r pp}
+prime_pure <- function(donnees) {
+  freq_annuelle <- predict(mod_freq, newdata = transform(donnees, expo = 1), type = "response")
+  cout_moyen <- predict(mod_cout, newdata = donnees, type = "response")
+  freq_annuelle * cout_moyen * coef_surcrete
+}
+train$pp <- prime_pure(train)
+test$pp <- prime_pure(test)
+base$pp <- prime_pure(base)
+
+round(quantile(base$pp, c(0, 0.01, 0.05, 0.25, 0.5, 0.75, 0.95, 0.99, 1)), 1)
+```
+
+## Ratio de bouclage
+
+Rapport entre la somme des primes pures (rapportées à l'exposition) et la charge observée. Il doit être proche de 1 sur l'apprentissage comme sur le test.
+
+```{r pp-bouclage}
+bouclage <- function(donnees, prime) {
+  sum(prime * donnees$expo) / sum(donnees$AMT_Claim)
+}
+c(apprentissage = round(bouclage(train, train$pp), 3), test = round(bouclage(test, test$pp), 3))
+```
+
+## Lift de la prime pure
+
+```{r pp-lift}
+test$decile_pp <- cut(rank(test$pp, ties.method = "first"), breaks = 10, labels = FALSE)
+lift_pp <- data.frame(decile = 1:10,
+                      charge_observee = tapply(test$AMT_Claim, test$decile_pp, sum) /
+                        tapply(test$expo, test$decile_pp, sum),
+                      prime_predite = tapply(test$pp * test$expo, test$decile_pp, sum) /
+                        tapply(test$expo, test$decile_pp, sum))
+
+barplot(t(as.matrix(lift_pp[, 2:3])), beside = TRUE, names.arg = 1:10,
+        col = c("firebrick", "steelblue"), border = NA,
+        xlab = "Décile de prime pure prédite", ylab = "EUR par année d'exposition",
+        main = "Charge observée et prime pure prédite par décile (test)")
+legend("topleft", legend = c("Charge observée", "Prime pure prédite"),
+       fill = c("firebrick", "steelblue"), bty = "n")
+```
+
+# Prime commerciale
+
+Un plancher de 40 € et un plafond de 800 € sont appliqués, puis les primes sont rééquilibrées pour que leur total reste égal à celui des primes pures.
+
+```{r pc-bornes}
+plancher <- 40
+plafond <- 800
+cat("Contrats au plancher :", sum(base$pp < plancher), "| au plafond :", sum(base$pp > plafond), "\n")
+
+base$pp_bornee <- pmin(pmax(base$pp, plancher), plafond)
+coef_equilibre <- sum(base$pp * base$expo) / sum(base$pp_bornee * base$expo)
+base$pp_bornee <- base$pp_bornee * coef_equilibre
+coef_equilibre
+```
+
+On ajoute un chargement de sécurité de 5 % et des frais d'acquisition de 3 % « en dedans ».
+
+```{r pc-chargements}
+base$prime_technique <- base$pp_bornee * 1.05
+base$prime_commerciale <- base$prime_technique / 0.97
+
+round(rbind("Prime pure" = summary(base$pp),
+            "Prime pure bornée" = summary(base$pp_bornee),
+            "Prime technique" = summary(base$prime_technique),
+            "Prime commerciale" = summary(base$prime_commerciale)), 1)
+
+c(bouclage_prime_bornee = round(bouclage(base, base$pp_bornee), 3),
+  bouclage_prime_commerciale = round(bouclage(base, base$prime_commerciale), 3))
+```
+
+```{r export}
+dir.create("out", showWarnings = FALSE)
+write.csv(base[, c("Id_pol", "expo", "pp", "pp_bornee", "prime_technique", "prime_commerciale")],
+          "out/tarif.csv", row.names = FALSE)
+```
+
+# Conclusion
+
+Le modèle est équilibré : le ratio de bouclage est proche de 1 sur l'apprentissage et sur le test. La segmentation repose surtout sur la fréquence, portée par les variables télématiques (distance, part de l'année conduite, conduite en semaine, freinages brusques, virages), l'ancienneté du véhicule et le score de crédit.
+
+Limites :
+
+- le modèle de coût est peu discriminant ;
+- avec un plancher de 40 €, une part importante des contrats paie la prime minimale : le plancher et le plafond sont des choix commerciaux à discuter ;
+- l'hypothèse de carence de 21 jours et le recodage des valeurs inconnues pourraient être testés en sensibilité.
